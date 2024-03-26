@@ -25,65 +25,84 @@ public class UdpServer
     public int port;
     public List<User> users;
     public int confirmationTimeout;
-    public int maxRetransmissions;
-    public int currentMessageId = 0;
+    public static int maxRetransmissions;
 
-    public int GetMessageId()
-    {
-        currentMessageId++;
-        return currentMessageId;
-    }
+    public static UdpClient client;
 
-    public UdpServer(string server, int port, List<User> users, int confirmationTimeout, int maxRetransmissions)
+    public static CancellationTokenSource startListinengToken = new CancellationTokenSource();
+    public UdpServer(string server, int port, ref List<User> users, int confirmationTimeout, int maxRetransmissions)
     {
         this.server = server;
         this.port = port;
         this.users = users;
-
+        this.confirmationTimeout = confirmationTimeout;
+        UdpServer.maxRetransmissions = maxRetransmissions;
     }
-    public async Task StartListening()
+    public async Task StartListening(CancellationTokenSource cts)
     {
-        UdpClient client = new UdpClient(port);
+        client = new UdpClient(port);
+        client.Client.ReceiveTimeout = confirmationTimeout;
         try
         {
-            while (true)
+            while (!cts.Token.IsCancellationRequested)
             {
                 UdpReceiveResult result;
                 try
                 {
-                    result = await client.ReceiveAsync().ConfigureAwait(false);
+                    Console.WriteLine("Waiting for a connection...");
+                    result = await client.ReceiveAsync(startListinengToken.Token).ConfigureAwait(false);
+                    var watch = System.Diagnostics.Stopwatch.StartNew();
+
+                    string clientEndPoint = result.RemoteEndPoint.ToString();
+                    bool userAlreadyExists = false;
+                    foreach (User compareUser in users)
+                    {
+                        Console.WriteLine("User: " + compareUser.clientEndPoint + " with the displayname " + (compareUser.DisplayName != null ? compareUser.DisplayName : "null") + " | " + compareUser.Protocol);
+                        if (compareUser.clientEndPoint == clientEndPoint)
+                        {
+                            userAlreadyExists = true;
+                        }
+                    }
+                    if (!userAlreadyExists)
+                    {
+                        users.Add(new User(clientEndPoint, "udp"));
+                    }
+                    User? user = users.Find(x => x.clientEndPoint == clientEndPoint);
+
+                    if (user == null)
+                    {
+                        Console.WriteLine("ERR: No user found");
+                        break;
+                    }
+                    HandleClientAsync(result, user);
+                    watch.Stop();
+
+                    Console.WriteLine($"Execution Time: {watch.ElapsedMilliseconds} ms");
                 }
-                catch (ObjectDisposedException)
+                catch (OperationCanceledException)
                 {
-                    // This will be thrown when the UdpClient is closed while awaiting ReceiveAsync
-                    break;
+                    //Console.WriteLine("Confirmation timed out");
                 }
-                string clientEndPoint = result.RemoteEndPoint.ToString();
-                if (!users.Contains(new User(clientEndPoint, "udp")))
+                catch (Exception ex)
                 {
-                    users.Add(new User(clientEndPoint, "udp"));
-                    //Console.WriteLine($"Saved new IP: {clientEndPoint}");
+                    Console.WriteLine("ERR " + ex.Message);
                 }
-                User? user = users.Find(x => x.clientEndPoint == clientEndPoint);
-                if (user == null)
-                {
-                    Console.WriteLine("ERR: No user found");
-                    return;
-                }
-                HandleClientAsync(client, result, user);
             }
         }
+
         catch (Exception ex)
         {
             Console.WriteLine("ERR " + ex.Message);
         }
         finally
         {
+            client.Close();
             Console.WriteLine("Server is shutting down.");
         }
     }
-    public async Task HandleClientAsync(UdpClient client, UdpReceiveResult messageBytes, User user)
+    public async Task HandleClientAsync(UdpReceiveResult messageBytes, User user)
     {
+        startListinengToken.Cancel();
         string clientEndPoint = messageBytes.RemoteEndPoint.ToString();
         byte[] serverResponse = messageBytes.Buffer;
         if (clientEndPoint == null)
@@ -93,185 +112,177 @@ public class UdpServer
         }
         MessageType msgType = (MessageType)serverResponse[0];
         int receivedMessageId = BitConverter.ToUInt16(new byte[] { serverResponse[1], serverResponse[2] }, 0);
+
         if (msgType == MessageType.AUTH)
         {
-
             string receivedUsername = ExtractString(serverResponse, startIndex: 3);
             string receivedDisplayName = ExtractString(serverResponse, startIndex: 3 + receivedUsername.Length + 1);
             string receivedSecret = ExtractString(serverResponse, startIndex: 3 + receivedUsername.Length + 1 + receivedDisplayName.Length + 1);
             user.HandleAuth(receivedUsername, receivedDisplayName, receivedSecret);
             user.HandleJoin("default");
             Console.WriteLine("RECV " + user.clientEndPoint + " | AUTH");
-            SendConfirm(receivedMessageId, client, user);
+            SendConfirm(receivedMessageId, user);
 
-            int replyMsgId = SendReply(receivedMessageId, client, user, "Auth success");
-            if (WaitConfirm(replyMsgId, client, user))
+            int replyMsgId = SendReply(receivedMessageId, user, "Auth success");
+            int attempts = 0;
+            if (!WaitConfirm(replyMsgId, user))
             {
-                Console.WriteLine("RECV " + user.clientEndPoint + " | CONFIRM");
-            }
-            else
-            {
-                Console.WriteLine("ERR: No confirmation received");
+                while (attempts < maxRetransmissions)
+                {
+                    replyMsgId = SendReply(receivedMessageId, user, "Auth success");
+                    if (WaitConfirm(replyMsgId, user))
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        if (attempts == maxRetransmissions - 1)
+                        {
+                            Console.WriteLine("ERR: No confirmation received");
+                            return;
+                        }
+                        attempts++;
+                    }
+                }
             }
             //TODO send msg to all users in default chanel
             //for performance reasons
             Thread.Sleep(100);
-            //for tcp users
             users.ForEach(x =>
                 {
-                    if (x.ChanelId != null)
+                    if (x.ChanelId == "default")
                     {
+                        //for tcp users
                         x.SendMsgTcp("MSG FROM Server IS " + receivedDisplayName + " has joined default" + "\r\n", "default");
+                        //for udp users
+                        SendMsgUdp(receivedDisplayName + " has joined default", "Server", x);
                     }
                 });
-            //for udp users
-            var messageBuilder = new UdpMessageBuilder();
-            messageBuilder.AddMessageType((byte)MessageType.MSG);
-            int messageId = GetMessageId();
-            messageBuilder.AddMessageId(messageId);
-            messageBuilder.AddStringWithDelimiter("Sever");
-            messageBuilder.AddStringWithDelimiter(receivedDisplayName + " has joined " + "default");
-            byte[] messageToSend = messageBuilder.GetMessage();
-            users.ForEach(x =>
-                {
-                    if (x.ChanelId != null && x.ChanelId == user.ChanelId)
-                    {
-                        SendMsgUdp(messageToSend, messageId, client, user);
-                    }
-                });
-
         }
         else if (msgType == MessageType.JOIN)
         {
             string receivedChanelId = ExtractString(serverResponse, startIndex: 3);
             string receivedDisplayName = ExtractString(serverResponse, startIndex: 3 + receivedChanelId.Length + 1);
+            users.ForEach(x =>
+                {
+                    if (x.ChanelId != null && x.ChanelId == user.ChanelId && x.Username != user.Username)
+                    {
+                        x.SendMsgTcp("MSG FROM Server IS " + receivedDisplayName + " has left " + user.ChanelId + "\r\n", user.ChanelId);
+                        UdpServer.SendMsgUdp(receivedDisplayName + " has left " + user.ChanelId, "Server", x);
+                    }
+                });
             user.HandleJoin(receivedChanelId);
             Console.WriteLine("RECV " + user.clientEndPoint + " | JOIN");
-            SendConfirm(receivedMessageId, client, user);
-            int replyMsgId =SendReply(receivedMessageId, client, user, "Join success");
-            if (WaitConfirm(replyMsgId, client, user))
+            SendConfirm(receivedMessageId, user);
+            int replyMsgId = SendReply(receivedMessageId, user, "Join success");
+            int attempts = 0;
+            if (!WaitConfirm(replyMsgId, user))
             {
-                Console.WriteLine("RECV " + user.clientEndPoint + " | CONFIRM");
-            }
-            else
-            {
-                Console.WriteLine("ERR: No confirmation received");
+                while (attempts < maxRetransmissions)
+                {
+                    replyMsgId = SendReply(receivedMessageId, user, "Join success");
+                    if (WaitConfirm(replyMsgId, user))
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        if (attempts == maxRetransmissions - 1)
+                        {
+                            Console.WriteLine("ERR: No confirmation received");
+                            return;
+                        }
+                        attempts++;
+                    }
+                }
             }
             //for performance reasons
             Thread.Sleep(100);
-            //for tcp users
             users.ForEach(x =>
                 {
                     if (x.ChanelId != null && x.ChanelId == user.ChanelId)
                     {
+                        //for tcp users
                         x.SendMsgTcp("MSG FROM Server IS " + receivedDisplayName + " has joined " + receivedChanelId + "\r\n", receivedChanelId);
-                    }
-                });
-            //for udp users
-            var messageBuilder = new UdpMessageBuilder();
-            messageBuilder.AddMessageType((byte)MessageType.MSG);
-            int messageId = GetMessageId();
-            messageBuilder.AddMessageId(messageId);
-            messageBuilder.AddStringWithDelimiter("Server");
-            messageBuilder.AddStringWithDelimiter(receivedDisplayName + " has joined " + receivedChanelId);
-            byte[] messageToSend = messageBuilder.GetMessage();
-            users.ForEach(x =>
-                {
-                    if (x.ChanelId != null && x.ChanelId == user.ChanelId)
-                    {
-                        SendMsgUdp(messageToSend, messageId, client, user);
-                    }
-                });
+                        //for udp users
+                        SendMsgUdp(receivedDisplayName + " has joined " + receivedChanelId, "Server", x);
 
+                    }
+                });
         }
         else if (msgType == MessageType.MSG)
         {
             string receivedDisplayName = ExtractString(serverResponse, startIndex: 3);
             string messageContents = ExtractString(serverResponse, startIndex: 3 + receivedDisplayName.Length + 1);
             Console.WriteLine("RECV " + user.clientEndPoint + " | MSG");
-            SendConfirm(receivedMessageId, client, user);
+            SendConfirm(receivedMessageId, user);
 
             //Send to all users in the chanel
             //for performance reasons
             Thread.Sleep(100);
-            //for tcp users
-            users.ForEach(x =>
-                {
-                    if (x.ChanelId != null && x.Username != user.Username && x.ChanelId == user.ChanelId)
-                    {
-                        x.SendMsgTcp("MSG FROM " + receivedDisplayName + " IS " + messageContents + "\r\n", user.ChanelId);
-                    }
-                });
-            //for udp users
-            var messageBuilder = new UdpMessageBuilder();
-            messageBuilder.AddMessageType((byte)MessageType.MSG);
-            int messageId = GetMessageId();
-            messageBuilder.AddMessageId(messageId);
-            messageBuilder.AddStringWithDelimiter(receivedDisplayName);
-            messageBuilder.AddStringWithDelimiter(receivedDisplayName + ": " + messageContents);
-            byte[] messageToSend = messageBuilder.GetMessage();
             users.ForEach(x =>
                 {
                     if (x.ChanelId != null && x.ChanelId == user.ChanelId && x.Username != user.Username)
                     {
-                        SendMsgUdp(messageToSend, messageId, client, user);
+                        //for tcp users
+                        x.SendMsgTcp("MSG FROM " + receivedDisplayName + " IS " + messageContents + "\r\n", user.ChanelId);
+                        //for udp users
+                        SendMsgUdp(messageContents, receivedDisplayName, x);
                     }
                 });
-
         }
         else if (msgType == MessageType.BYE)
         {
             //Console.WriteLine("Server has closed the connection.");
-            SendConfirm(receivedMessageId, client, user);
+            Console.WriteLine("RECV " + user.clientEndPoint + " | BYE");
+            SendConfirm(receivedMessageId, user);
             //Send to all users that user has left
             //for performance reasons
             Thread.Sleep(100);
-            //for tcp users
             users.ForEach(x =>
                 {
                     if (x.ChanelId != null && x.Username != user.Username && x.ChanelId == user.ChanelId)
                     {
+                        //for tcp users
                         x.SendMsgTcp("MSG FROM Server IS " + user.DisplayName + " has left the " + user.ChanelId + "\r\n", user.ChanelId);
+                        //for udp users
+                        UdpServer.SendMsgUdp(user.DisplayName + " has left the " + user.ChanelId, "Server", x);
                     }
                 });
-            //for udp users
-            var messageBuilder = new UdpMessageBuilder();
-            messageBuilder.AddMessageType((byte)MessageType.BYE);
-            int messageId = GetMessageId();
-            messageBuilder.AddMessageId(messageId);
-            byte[] messageToSend = messageBuilder.GetMessage();
-            users.ForEach(x =>
-                {
-                    if (x.ChanelId != null && x.ChanelId == user.ChanelId)
-                    {
-                        SendMsgUdp(messageToSend, messageId, client, user);
-                    }
-                });
+
 
             users.Remove(user);
         }
+        startListinengToken = new CancellationTokenSource();
     }
 
-    public bool WaitConfirm(int messageId, UdpClient client, User user)
+    public static bool WaitConfirm(int messageId, User user)
     {
         try
         {
             string clientIp = user.clientEndPoint.Split(':')[0];
             int clientPort = int.Parse(user.clientEndPoint.Split(':')[1]);
             IPEndPoint endpoint = new IPEndPoint(IPAddress.Parse(clientIp), clientPort);
+            //also for performance reasons
+            //Thread.Sleep(100);
             byte[] serverResponse = client.Receive(ref endpoint);
+
+            byte[] responseMessageIdBytes = new byte[] { serverResponse[1], serverResponse[2] };
+            if (endpoint.Address.ToString() != clientIp || endpoint.Port != clientPort)
+            {
+                return false;
+            }
             // Check if the response is a "CONFIRM" message
             if (serverResponse[0] == (byte)MessageType.CONFIRM)
             {
                 // Extract the message ID from the response
-                byte[] responseMessageIdBytes = new byte[] { serverResponse[1], serverResponse[2] };
                 if (BitConverter.ToInt16(responseMessageIdBytes, 0) != messageId)
                 {
                     return false;
                 }
                 else
                 {
-                    int responseMessageId = BitConverter.ToInt16(responseMessageIdBytes, 0);
+                    Console.WriteLine("RECV " + user.clientEndPoint + " | CONFIRM");
                     return true;
                 }
             }
@@ -297,7 +308,7 @@ public class UdpServer
         return false;
     }
 
-    public void SendConfirm(int messageId, UdpClient client, User user)
+    public static void SendConfirm(int messageId, User user)
     {
         byte[] message = new byte[1 + 2];
         message[0] = (byte)MessageType.CONFIRM; // CONFIRM message type
@@ -309,11 +320,11 @@ public class UdpServer
         Console.WriteLine("SENT " + user.clientEndPoint + " | CONFIRM");
     }
 
-    public int SendReply(int replyMessageId, UdpClient client, User user, string messageContent)
+    public static int SendReply(int replyMessageId, User user, string messageContent)
     {
         var messageBuilder = new UdpMessageBuilder();
         messageBuilder.AddMessageType((byte)MessageType.REPLY);
-        int messageId = GetMessageId();
+        int messageId = UdpMessageBuilder.GetMessageId();
         messageBuilder.AddMessageId(messageId);
         messageBuilder.AddResult(byte.Parse("1"));
         messageBuilder.AddRefMessageId(replyMessageId);
@@ -323,26 +334,32 @@ public class UdpServer
         int clientPort = int.Parse(user.clientEndPoint.Split(':')[1]);
         client.Send(message, message.Length, clientIp, clientPort);
         Console.WriteLine("SENT " + user.clientEndPoint + " | REPLY");
+
         return messageId;
     }
 
-    public void SendMsgUdp(byte[] message, int messageId, UdpClient client, User user)
+    public static void SendErr(User user, string messageContent)
     {
+        var messageBuilder = new UdpMessageBuilder();
+        messageBuilder.AddMessageType((byte)MessageType.ERR);
+        int messageId = UdpMessageBuilder.GetMessageId();
+        messageBuilder.AddMessageId(messageId);
+        messageBuilder.AddStringWithDelimiter(messageContent);
+        byte[] message = messageBuilder.GetMessage();
         string clientIp = user.clientEndPoint.Split(':')[0];
         int clientPort = int.Parse(user.clientEndPoint.Split(':')[1]);
         client.Send(message, message.Length, clientIp, clientPort);
         int attempts = 0;
-        if (!WaitConfirm(messageId, client, user))
+        if (!WaitConfirm(messageId, user))
         {
             while (attempts < maxRetransmissions)
             {
-                messageId = GetMessageId();
+                messageId = UdpMessageBuilder.GetMessageId();
                 UdpMessageBuilder.ReplaceMessageId(message, messageId);
-                client.Send(message, message.Length, server, port);
-                if (WaitConfirm(messageId, client, user))
+                client.Send(message, message.Length, clientIp, clientPort);
+                if (WaitConfirm(messageId, user))
                 {
-                    Console.WriteLine("SENT " + user.clientEndPoint + " | MSG");
-
+                    Console.WriteLine("SENT " + user.clientEndPoint + " | ERR");
                     break;
                 }
                 else
@@ -357,9 +374,53 @@ public class UdpServer
         }
         else
         {
-            Console.WriteLine("SENT " + user.clientEndPoint + " | MSG");
+            Console.WriteLine("SENT " + user.clientEndPoint + " | ERR");
         }
+    }
 
+
+    public static void SendMsgUdp(string msgContent, string receivedDisplayName, User user)
+    {
+        if (user.Protocol != "udp")
+        {
+            return;
+        }
+        startListinengToken.Cancel();
+        var messageBuilder = new UdpMessageBuilder();
+        messageBuilder.AddMessageType((byte)MessageType.MSG);
+        int messageId = UdpMessageBuilder.GetMessageId();
+        messageBuilder.AddMessageId(messageId);
+        messageBuilder.AddStringWithDelimiter(receivedDisplayName);
+        messageBuilder.AddStringWithDelimiter(msgContent);
+        byte[] messageToSend = messageBuilder.GetMessage();
+        string clientIp = user.clientEndPoint.Split(':')[0];
+        int clientPort = int.Parse(user.clientEndPoint.Split(':')[1]);
+        client.Send(messageToSend, messageToSend.Length, clientIp, clientPort);
+
+        int attempts = 0;
+        Console.WriteLine("SENT " + user.clientEndPoint + " | MSG");
+        if (!WaitConfirm(messageId, user))
+        {
+            while (attempts < maxRetransmissions)
+            {
+                messageId = UdpMessageBuilder.GetMessageId();
+                UdpMessageBuilder.ReplaceMessageId(messageToSend, messageId);
+                client.Send(messageToSend, messageToSend.Length, clientIp, clientPort);
+                if (WaitConfirm(messageId, user))
+                {
+                    break;
+                }
+                else
+                {
+                    if (attempts == maxRetransmissions)
+                    {
+                        break;
+                    }
+                    attempts++;
+                }
+            }
+        }
+        startListinengToken = new CancellationTokenSource();
     }
 
     private static string ExtractString(byte[] bytes, int startIndex)

@@ -14,7 +14,7 @@ public class TcpServer
     public int port;
     public List<User> users;
 
-    public TcpServer(string server, int port, List<User> users)
+    public TcpServer(string server, int port, ref List<User> users)
     {
         this.server = server;
         this.port = port;
@@ -22,14 +22,14 @@ public class TcpServer
 
     }
 
-    public async Task StartListening()
+    public async Task StartListening(CancellationTokenSource cts)
     {
         var listener = new TcpListener(IPAddress.Parse(server), port);
         listener.Start();
 
         try
         {
-            while (true)
+            while (!cts.Token.IsCancellationRequested)
             {
                 //Console.WriteLine("Waiting for a connection...");
                 // Asynchronously wait for an incoming connection
@@ -113,7 +113,16 @@ public class TcpServer
                 user.HandleJoin("default");
                 //for performance reasons
                 Thread.Sleep(100);
-                users.ForEach(x => x.SendMsgTcp("MSG FROM Server IS " + user.DisplayName + " has joined default\r\n", "default"));
+                users.ForEach(x =>
+                {
+                    if (x.ChanelId == "default")
+                    {
+                        //for tcp users
+                        x.SendMsgTcp("MSG FROM Server IS " + displayName + " has joined default" + "\r\n", "default");
+                        //for udp users
+                        UdpServer.SendMsgUdp(displayName + " has joined default", "Server", x);
+                    }
+                });
             }
             else
             {
@@ -122,7 +131,7 @@ public class TcpServer
         }
         else if (responseData.Contains("MSG"))
         {
-            string pattern = @"MSG FROM (\S+) IS (\S+)";
+            string pattern = @"MSG FROM (\S+) IS (.+)";
             Regex regex = new Regex(pattern);
 
             // Match the regular expression pattern against a text string
@@ -136,9 +145,10 @@ public class TcpServer
 
                 users.ForEach(x =>
                 {
-                    if (x.ChanelId != null && x.Username != user.Username)
+                    if (x.ChanelId != null && x.ChanelId == user.ChanelId && x.Username != user.Username)
                     {
                         x.SendMsgTcp("MSG FROM " + displayName + " IS " + message + "\r\n", user.ChanelId);
+                        UdpServer.SendMsgUdp(message, displayName, x);
                     }
                 });
             }
@@ -153,9 +163,10 @@ public class TcpServer
             SendResponse("BYE", user.stream, user);
             users.ForEach(x =>
                 {
-                    if (x.ChanelId != null && x.Username != user.Username)
+                    if (x.ChanelId != null && x.ChanelId == user.ChanelId && x.Username != user.Username)
                     {
                         x.SendMsgTcp("MSG FROM Server IS " + user.DisplayName + " has left the " + user.ChanelId + "\r\n", user.ChanelId);
+                        UdpServer.SendMsgUdp(user.DisplayName + " has left the " + user.ChanelId, "Server", x);
                     }
                 });
             users.Remove(user);
@@ -175,15 +186,24 @@ public class TcpServer
                 string displayName = match.Groups[2].Value.Trim();
                 Console.WriteLine("RECV " + user.clientEndPoint + " | JOIN");
                 user.ChangeDisplayName(displayName);
+                users.ForEach(x =>
+                {
+                    if (x.ChanelId != null && x.ChanelId == user.ChanelId && x.Username != user.Username)
+                    {
+                        x.SendMsgTcp("MSG FROM Server IS " + displayName + " has left " + user.ChanelId + "\r\n", user.ChanelId);
+                        UdpServer.SendMsgUdp(displayName + " has left " + user.ChanelId, "Server", x);
+                    }
+                });
                 user.HandleJoin(chanelId);
                 SendResponse("REPLY OK IS Join success", user.stream, user);
                 //for performance reasons
                 Thread.Sleep(100);
                 users.ForEach(x =>
                 {
-                    if (x.ChanelId != null)
+                    if (x.ChanelId != null && x.ChanelId == user.ChanelId)
                     {
                         x.SendMsgTcp("MSG FROM Server IS " + displayName + " has joined " + chanelId + "\r\n", chanelId);
+                        UdpServer.SendMsgUdp(displayName + " has joined " + chanelId, "Server", x);
                     }
                 });
             }
@@ -197,9 +217,10 @@ public class TcpServer
             Console.WriteLine("RECV " + user.clientEndPoint + " | BYE");
             users.ForEach(x =>
                 {
-                    if (x.ChanelId != null && x.Username != user.Username)
+                    if (x.ChanelId != null && x.Username != user.Username && x.ChanelId == user.ChanelId)
                     {
                         x.SendMsgTcp("MSG FROM Server IS " + user.DisplayName + " has left the " + user.ChanelId + "\r\n", user.ChanelId);
+                        UdpServer.SendMsgUdp(user.DisplayName + " has left the " + user.ChanelId, "Server", x);
                     }
                 });
             users.Remove(user);
@@ -208,8 +229,6 @@ public class TcpServer
         {
             SendResponse("ERR FROM Server IS Unknown command", user.stream, user);
         }
-
-
     }
     public void SendResponse(string message, NetworkStream stream, User user)
     {

@@ -13,6 +13,14 @@ public class UdpMessageBuilder
         _writer = new BinaryWriter(_stream);
     }
 
+    public static int currentMessageId = 0;
+
+    public static int GetMessageId()
+    {
+        currentMessageId++;
+        return currentMessageId;
+    }
+
     public void AddMessageType(byte messageType)
     {
         _writer.Write(messageType);

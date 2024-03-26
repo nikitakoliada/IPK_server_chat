@@ -58,37 +58,40 @@ namespace ChatServerSide
             // Create a new instances of the MessageService
             //UdpServer udpServer = new UdpServer(server, port, confirmationTimeout, maxRetransmissions);
             List<User> users = new List<User> { };
-            TcpServer tcpServer = new TcpServer(server, port, users);
-            UdpServer udpServer = new UdpServer(server, port, users, confirmationTimeout, maxRetransmissions);
+            bool pts = false;
+            TcpServer tcpServer = new TcpServer(server, port,  ref users);
+            UdpServer udpServer = new UdpServer(server, port, ref users, confirmationTimeout, maxRetransmissions);
+            CancellationTokenSource cts = new CancellationTokenSource();
             var quitEvent = new ManualResetEvent(false);
+
             Console.CancelKeyPress += (sender, eArgs) =>
             {
                 quitEvent.Set();
                 eArgs.Cancel = true;
             };
-            var tcpListeningTask = tcpServer.StartListening();
-            var udpListeningTask = udpServer.StartListening();
+            var tcpListeningTask = tcpServer.StartListening(cts);
+            var udpListeningTask = udpServer.StartListening(cts);
+            Console.CancelKeyPress += new ConsoleCancelEventHandler((sender, e) => CancellationHandler(sender, e, tcpListeningTask, udpListeningTask, cts));
             quitEvent.WaitOne();
         }
 
-        // private static void CancellationHandler(object? sender, ConsoleCancelEventArgs e, bool authorised, CancellationTokenSource cts, MessageService messageService, dynamic listeningTask)
-        // {
-        //     if (authorised == true)
-        //     {
-        //         try
-        //         {
-        //             cts.Cancel();
-        //             listeningTask.Wait();
-        //             messageService.HandleBye();
-        //             messageService.Close();
-        //             Environment.Exit(0);
-        //             return;
-        //         }
-        //         catch (Exception ex)
-        //         {
-        //             Console.WriteLine("ERR: " + ex.Message);
-        //         }
-        //     }
-        // }
+        private static void CancellationHandler(object? sender, ConsoleCancelEventArgs e, dynamic tcpListeningTask, dynamic udpListeningTask , CancellationTokenSource cts)
+        {
+
+            try
+            {
+                cts.Cancel();
+                
+                tcpListeningTask.Wait();
+                udpListeningTask.Wait();
+                Environment.Exit(0);
+                return;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("ERR: " + ex.Message);
+            }
+        }
+
     }
 }
